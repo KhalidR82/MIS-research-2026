@@ -1,0 +1,266 @@
+"""
+Dynamic Logistic Regression Model - linked to the Kaggle dataset
+=================================================================
+Data source (live link):
+  Retail Store Inventory Forecasting Dataset
+  https://www.kaggle.com/datasets/anirudhchauhan/retail-store-inventory-forecasting-dataset
+
+How the dynamic link works
+--------------------------
+On every run the script pulls the latest version of the dataset straight from
+the Kaggle link above, re-estimates the model, and records which data version
+and retrieval time produced the results. It tries these sources in order:
+
+  1) Kaggle Notebook input folder  (/kaggle/input/...)   - when run on Kaggle
+  2) kagglehub                     (latest version)       - recommended locally
+  3) Official Kaggle API           (kaggle package)       - fallback
+  4) Local CSV file                (LOCAL_CSV)            - offline fallback
+
+Outputs (SPSS-style), saved to an Excel file:
+  - Block 0 and Block 1 "Variables in the Equation"
+  - Omnibus Tests of Model Coefficients
+  - Model Summary (-2LL, Cox & Snell R2, Nagelkerke R2)
+  - Classification Table
+  - Predicted probability for each observation
+  - Run Info (data source, version, retrieval time, library versions)
+
+Setup (one time):
+  pip install kagglehub pandas numpy statsmodels scipy openpyxl
+  Kaggle API token: kaggle.com > Settings > API > Create New Token,
+  then place kaggle.json in ~/.kaggle/  (Windows: C:\\Users\\<you>\\.kaggle\\)
+
+Run:
+  python dynamic_logistic_kaggle_v2.py
+"""
+
+import glob
+import os
+import platform
+import sys
+from datetime import datetime, timezone
+
+import numpy as np
+import pandas as pd
+import scipy
+import statsmodels
+import statsmodels.api as sm
+from scipy import stats
+
+# =========================== SETTINGS (edit here) ===========================
+KAGGLE_URL = "https://www.kaggle.com/datasets/anirudhchauhan/retail-store-inventory-forecasting-dataset"
+DATASET = "anirudhchauhan/retail-store-inventory-forecasting-dataset"
+
+# Optional: a public direct link to the CSV outside Kaggle (GitHub raw, Google
+# Drive, Zenodo, OSF...). When set, it is used first and needs no Kaggle account.
+#   GitHub : https://raw.githubusercontent.com/<user>/<repo>/main/retail_store_inventory.csv
+#   Drive  : https://drive.google.com/uc?export=download&id=<FILE_ID>
+DATA_URL = ""
+
+# Dependent variable (binary 0/1)
+TARGET = "Holiday/Promotion"
+
+# Independent variables
+NUMERIC = ["Price", "Discount", "Competitor Pricing", "Units Sold", "Inventory Level"]
+CATEGORICAL = ["Category", "Region", "Weather Condition", "Seasonality"]
+
+# Optional: random sample size to match an SPSS sample (None = use all rows)
+SAMPLE_SIZE = None
+RANDOM_SEED = 42
+
+CUT_VALUE = 0.5                          # classification cut value (SPSS default)
+LOCAL_CSV = "retail_store_inventory.csv" # offline fallback
+OUTPUT_FILE = "logistic_results.xlsx"
+# ============================================================================
+
+
+# --------------------------- 1. Dynamic data link ---------------------------
+def _first_csv(folder: str):
+    files = glob.glob(os.path.join(folder, "**", "*.csv"), recursive=True)
+    return files[0] if files else None
+
+
+def load_latest_data():
+    """Fetch the latest dataset from the Kaggle link; return (DataFrame, source info)."""
+    attempts = []
+
+    # 0) Public direct link (non-Kaggle), if provided
+    if DATA_URL:
+        try:
+            return pd.read_csv(DATA_URL), {"Source": "Public URL", "File": DATA_URL}
+        except Exception as e:
+            attempts.append(f"DATA_URL: {e}")
+
+    # 1) Running inside a Kaggle Notebook
+    kaggle_input = "/kaggle/input"
+    if os.path.isdir(kaggle_input):
+        csv = _first_csv(kaggle_input)
+        if csv:
+            return pd.read_csv(csv), {"Source": "Kaggle Notebook input", "File": csv}
+
+    # 2) kagglehub - always resolves to the latest dataset version
+    try:
+        import kagglehub
+        path = kagglehub.dataset_download(DATASET)
+        csv = _first_csv(path)
+        if csv:
+            version = os.path.basename(os.path.normpath(path))
+            return pd.read_csv(csv), {"Source": "kagglehub (latest version)",
+                                      "Dataset version": version, "File": csv}
+    except Exception as e:
+        attempts.append(f"kagglehub: {e}")
+
+    # 3) Official Kaggle API
+    try:
+        from kaggle.api.kaggle_api_extended import KaggleApi
+        api = KaggleApi()
+        api.authenticate()
+        target_dir = os.path.join(os.getcwd(), "kaggle_data")
+        api.dataset_download_files(DATASET, path=target_dir, unzip=True, force=True)
+        csv = _first_csv(target_dir)
+        if csv:
+            return pd.read_csv(csv), {"Source": "Kaggle API (latest version)", "File": csv}
+    except Exception as e:
+        attempts.append(f"Kaggle API: {e}")
+
+    # 4) Local CSV fallback
+    if os.path.isfile(LOCAL_CSV):
+        print("WARNING: Kaggle not reachable - using local CSV (not live).")
+        return pd.read_csv(LOCAL_CSV), {"Source": "Local CSV (offline fallback)",
+                                        "File": os.path.abspath(LOCAL_CSV)}
+
+    raise RuntimeError(
+        "Could not load the dataset.\n  " + "\n  ".join(attempts) +
+        f"\nCheck your Kaggle token, or download the CSV from:\n  {KAGGLE_URL}\n"
+        f"and save it as '{LOCAL_CSV}' next to this script."
+    )
+
+
+# ------------------------------ 2. Preparation ------------------------------
+def prepare(df: pd.DataFrame):
+    needed = [TARGET, *NUMERIC, *CATEGORICAL]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing columns: {missing}\nAvailable: {list(df.columns)}")
+
+    data = df[needed].dropna()
+    if SAMPLE_SIZE and SAMPLE_SIZE < len(data):
+        data = data.sample(n=SAMPLE_SIZE, random_state=RANDOM_SEED)
+
+    levels = sorted(data[TARGET].unique())
+    if len(levels) != 2:
+        raise ValueError(f"TARGET must be binary; found values: {levels}")
+    y = (data[TARGET] == levels[1]).astype(int)
+
+    X = pd.get_dummies(data[NUMERIC + CATEGORICAL], columns=CATEGORICAL,
+                       drop_first=True, dtype=float)   # first level = reference
+    X = sm.add_constant(X)
+    return data, X, y
+
+
+# ------------------------------ 3. SPSS tables ------------------------------
+def variables_in_equation(result) -> pd.DataFrame:
+    b, se = result.params, result.bse
+    wald = (b / se) ** 2
+    ci = np.exp(result.conf_int())
+    t = pd.DataFrame({
+        "B": b, "S.E.": se, "Wald": wald, "df": 1,
+        "Sig.": stats.chi2.sf(wald, 1), "Exp(B)": np.exp(b),
+        "95% C.I. Lower": ci[0], "95% C.I. Upper": ci[1],
+    }).round(3)
+    t.index = ["Constant" if i == "const" else i for i in t.index]
+    # SPSS lists the constant last
+    return pd.concat([t.drop("Constant"), t.loc[["Constant"]]])
+
+
+def classification_table(y, prob) -> pd.DataFrame:
+    pred = (prob >= CUT_VALUE).astype(int)
+    rows = {}
+    for actual in (0, 1):
+        mask = y == actual
+        n0, n1 = int(((pred == 0) & mask).sum()), int(((pred == 1) & mask).sum())
+        rows[f"Observed {actual}"] = [n0, n1, round(100 * (n1 if actual else n0) / max(mask.sum(), 1), 1)]
+    rows["Overall Percentage"] = ["", "", round(100 * (pred == y).mean(), 1)]
+    return pd.DataFrame.from_dict(rows, orient="index", dtype=object,
+                                  columns=["Predicted 0", "Predicted 1", "Percentage Correct"])
+
+
+# --------------------------------- 4. Main ----------------------------------
+def main():
+    retrieved_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    df, source = load_latest_data()
+    print(f"Loaded {len(df):,} rows from: {source['Source']}")
+
+    data, X, y = prepare(df)
+    n = len(y)
+
+    # Block 0: constant only
+    block0 = sm.Logit(y, np.ones((n, 1))).fit(disp=0)
+    b0 = block0.params.iloc[0]
+    se0 = block0.bse.iloc[0]
+    t0 = pd.DataFrame({"B": [b0], "S.E.": [se0], "Wald": [(b0 / se0) ** 2], "df": [1],
+                       "Sig.": [stats.chi2.sf((b0 / se0) ** 2, 1)], "Exp(B)": [np.exp(b0)]},
+                      index=["Constant"]).round(3)
+
+    # Block 1: with predictors
+    block1 = sm.Logit(y, X).fit(disp=0, maxiter=200)
+    t1 = variables_in_equation(block1)
+    prob = block1.predict(X)
+
+    # Omnibus test and model summary
+    chi2 = 2 * (block1.llf - block0.llf)
+    dfm = int(block1.df_model)
+    omnibus = pd.DataFrame({"Chi-square": [chi2] * 3, "df": [dfm] * 3,
+                            "Sig.": [stats.chi2.sf(chi2, dfm)] * 3},
+                           index=["Step", "Block", "Model"]).round(3)
+    cox_snell = 1 - np.exp(-chi2 / n)
+    nagelkerke = cox_snell / (1 - np.exp(2 * block0.llf / n))
+    summary = pd.DataFrame({"-2 Log likelihood": [-2 * block1.llf],
+                            "Cox & Snell R Square": [cox_snell],
+                            "Nagelkerke R Square": [nagelkerke]}, index=["Step 1"]).round(3)
+    cls = classification_table(y, prob)
+
+    # Run info (reproducibility record)
+    run_info = pd.DataFrame.from_dict({
+        "Data link": KAGGLE_URL,
+        **source,
+        "Retrieved at": retrieved_at,
+        "Rows in dataset": len(df),
+        "Cases in model (N)": n,
+        "Dependent variable": TARGET,
+        "Python": platform.python_version(),
+        "pandas": pd.__version__,
+        "numpy": np.__version__,
+        "statsmodels": statsmodels.__version__,
+        "scipy": scipy.__version__,
+    }, orient="index", columns=["Value"])
+
+    # Print
+    for title, table in [("Block 0 - Variables in the Equation", t0),
+                         ("Omnibus Tests of Model Coefficients", omnibus),
+                         ("Model Summary", summary),
+                         ("Classification Table", cls),
+                         ("Block 1 - Variables in the Equation", t1),
+                         ("Run Info", run_info)]:
+        print(f"\n{title}\n{table.to_string()}")
+
+    # Save
+    out = df.loc[data.index].copy()
+    out["Predicted_Probability"] = prob.round(4).values
+    out["Predicted_Group"] = (prob >= CUT_VALUE).astype(int).values
+    with pd.ExcelWriter(OUTPUT_FILE) as w:
+        run_info.to_excel(w, sheet_name="Run Info")
+        t0.to_excel(w, sheet_name="Block 0")
+        omnibus.to_excel(w, sheet_name="Omnibus Test")
+        summary.to_excel(w, sheet_name="Model Summary")
+        cls.to_excel(w, sheet_name="Classification")
+        t1.to_excel(w, sheet_name="Block 1")
+        out.to_excel(w, sheet_name="Predictions", index=False)
+    print(f"\nResults saved to {OUTPUT_FILE}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as err:
+        print(f"\nERROR: {err}", file=sys.stderr)
+        sys.exit(1)
